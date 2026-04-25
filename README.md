@@ -120,9 +120,9 @@ The system is divided into two main nodes:
 
 ---
 
-## 📷 Project Image
+## 📷 Project circuit:-
 
-![Project](images/project.jpg)
+in circuit folder
 
 ---
 
@@ -134,8 +134,8 @@ The system is divided into two main nodes:
 
 ## 💻 Code Structure
 
-* `/code/lora_tx.ino` → Transmitter
-* `/code/lora_rx.ino` → Receiver + Blynk
+ → Transmitter
+ → Receiver + Blynk
 
 ---
 
