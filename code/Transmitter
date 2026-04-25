@@ -1,1 +1,44 @@
+#include <SPI.h>
+#include <LoRa.h>
 
+#define ss 10
+#define rst 9
+#define dio0 2
+
+const int soilSensorPin = A0;
+
+int AirValue = 438;   
+int WaterValue = 142; 
+
+void setup() {
+  Serial.begin(9600);
+  LoRa.setPins(ss, rst, dio0);
+  
+  if (!LoRa.begin(434E6)) {
+    Serial.println("Nano LoRa Error!");
+    while (1);
+  }
+  LoRa.setSyncWord(0xA5); 
+  
+  Serial.println("Nano Transmitter Ready - FINAL!");
+}
+
+void loop() {
+  int sensorValue = analogRead(soilSensorPin);
+  
+  int moisturePercent = map(sensorValue, AirValue, WaterValue, 0, 100);
+  moisturePercent = constrain(moisturePercent, 0, 100);
+
+  String sendData = "WET:" + String(moisturePercent);
+
+  LoRa.beginPacket();
+  LoRa.print(sendData);
+  LoRa.endPacket();
+
+  Serial.print("Raw: ");
+  Serial.print(sensorValue);
+  Serial.print(" | Bheja: ");
+  Serial.println(sendData);
+
+  delay(2000); 
+}
