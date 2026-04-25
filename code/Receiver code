@@ -1,0 +1,202 @@
+// --- BLYNK TEMPLATE INFO ---
+#define BLYNK_TEMPLATE_ID "TMPL3P8LM5o7l"
+#define BLYNK_TEMPLATE_NAME "smart irrigation system "
+
+
+#define BLYNK_FIRMWARE_VERSION        "0.1.0"
+#define BLYNK_PRINT Serial
+
+#define USE_ESP32_DEV_MODULE
+#include "BlynkEdgent.h"
+
+#include <ESP32Servo.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo faatakServo;
+
+// --- FINAL HARDWARE PINS (Safe Pins) ---
+const int pumpPin = 25;      
+const int servoPin = 2;     
+const int btnFaatakPin = 15;  
+const int btnHour = 12;       
+const int btnMin = 13;       
+const int btnStart = 32;     
+
+#define ss 5
+#define rst 14
+#define dio0 26
+
+// RELAY LOGIC 
+#define RELAY_ON HIGH   
+#define RELAY_OFF LOW
+
+volatile bool systemActive = true; 
+volatile bool faatakOpen = false;  
+volatile int targetMoisture = 60;   
+volatile int tHours = 0, tMins = 0, tSecs = 0;
+volatile bool isTimerRunning = false;
+volatile bool isAutoMode = false;   
+volatile int moisturePercent = 0;
+
+int currentRelayState = RELAY_OFF;  
+TaskHandle_t HW_Task;
+
+char blynkLcdLine1[21] = "System Booting..    ";
+char blynkLcdLine2[21] = "                    ";
+
+// --- BLYNK FUNCTIONS ---
+BLYNK_WRITE(V0) { 
+  systemActive = param.asInt(); 
+  if (!systemActive) { isTimerRunning = false; isAutoMode = false; tHours = 0; tMins = 0; tSecs = 0; } 
+}
+BLYNK_WRITE(V1) { 
+  faatakOpen = param.asInt(); 
+  if (faatakOpen) faatakServo.write(90); else faatakServo.write(0); 
+}
+BLYNK_WRITE(V5) { 
+  if (systemActive && !isTimerRunning) isAutoMode = param.asInt(); 
+  else Blynk.virtualWrite(V5, 0); 
+}
+BLYNK_WRITE(V6) { targetMoisture = param.asInt(); }
+
+// --- HARDWARE LOGIC ---
+void HardwareLogic(void * pvParameters) {
+  unsigned long lastTick = 0, lastDisp = 0;
+  unsigned long lastBtnFaatak = 0, lastBtnHour = 0, lastBtnMin = 0, lastBtnStart = 0;
+
+  for(;;) { 
+    unsigned long currentMillis = millis();
+
+    // 1. Faatak Button (Ab Pin 19 par hai, ghosting nahi hogi)
+    if (digitalRead(btnFaatakPin) == LOW && currentMillis - lastBtnFaatak > 400) { 
+      faatakOpen = !faatakOpen; 
+      if (faatakOpen) faatakServo.write(90); else faatakServo.write(0); 
+      Blynk.virtualWrite(V1, faatakOpen); 
+      lastBtnFaatak = currentMillis;
+    }
+
+    // 2. Timer Buttons
+    if (systemActive && !isTimerRunning) {
+      if (digitalRead(btnHour) == LOW && currentMillis - lastBtnHour > 350) { 
+        tHours++; if(tHours > 23) tHours = 0; isAutoMode = false; lastBtnHour = currentMillis; 
+      }
+      if (digitalRead(btnMin) == LOW && currentMillis - lastBtnMin > 350) { 
+        tMins++; if(tMins > 59) tMins = 0; isAutoMode = false; lastBtnMin = currentMillis; 
+      }
+    }
+
+    // 3. Start Button
+    if (systemActive && digitalRead(btnStart) == LOW && currentMillis - lastBtnStart > 500) { 
+      if (tHours > 0 || tMins > 0 || tSecs > 0 || isTimerRunning) { 
+        isTimerRunning = !isTimerRunning; 
+        if(!isTimerRunning) { tHours = 0; tMins = 0; tSecs = 0; } else { lastTick = millis(); } 
+        isAutoMode = false; 
+      } else { isAutoMode = !isAutoMode; } 
+      lastBtnStart = currentMillis;
+    }
+
+    // 4. Timer Logic
+    if (isTimerRunning && systemActive && currentMillis - lastTick >= 1000) { 
+      lastTick = currentMillis; 
+      if (tSecs > 0) tSecs--; 
+      else if (tMins > 0) { tMins--; tSecs = 59; } 
+      else if (tHours > 0) { tHours--; tMins = 59; tSecs = 59; } 
+      else isTimerRunning = false; 
+    }
+
+    // 5. LoRa Receive
+    int packetSize = LoRa.parsePacket(); 
+    if (packetSize) {
+      String incoming = "";
+      while (LoRa.available()) incoming += (char)LoRa.read();
+      incoming.trim();
+      if (incoming.startsWith("WET:")) {
+        moisturePercent = incoming.substring(4).toInt();
+      }
+    }
+
+    // 6. Relay Logic (Auto/Timer)
+    int desiredRelayState = RELAY_OFF; 
+    if (!systemActive) desiredRelayState = RELAY_OFF;
+    else if (isTimerRunning) desiredRelayState = RELAY_ON;  
+    else if (isAutoMode) {
+      if (moisturePercent >= targetMoisture) desiredRelayState = RELAY_OFF;
+      else desiredRelayState = RELAY_ON;  
+    } 
+    if (desiredRelayState != currentRelayState) { 
+      digitalWrite(pumpPin, desiredRelayState); 
+      currentRelayState = desiredRelayState; 
+    }
+
+    // 7. LCD Display Update
+    if (currentMillis - lastDisp > 500) { 
+      lastDisp = currentMillis;
+      if (!systemActive) { 
+        strcpy(blynkLcdLine1, "SYSTEM OFF (App)"); 
+        strcpy(blynkLcdLine2, "Motor: OFF      "); 
+      } else if (isTimerRunning) { 
+        char tStr[21]; sprintf(tStr, "Time:%02d:%02d:%02d  ", tHours, tMins, tSecs); 
+        strcpy(blynkLcdLine1, "Timer ON: Rel ON"); strcpy(blynkLcdLine2, tStr); 
+      } else if (isAutoMode) { 
+        char mStr[21]; sprintf(mStr, "M:%02d%% Set:%02d%%  ", moisturePercent, targetMoisture); 
+        strcpy(blynkLcdLine1, mStr); 
+        if (moisturePercent >= targetMoisture) strcpy(blynkLcdLine2, "Motor: OFF      "); 
+        else strcpy(blynkLcdLine2, "Motor: ON (Dry) "); 
+      } else { 
+        char tStr[21]; sprintf(tStr, "Set Time:%02d:%02d  ", tHours, tMins); 
+        strcpy(blynkLcdLine1, "Manual/Standby  "); strcpy(blynkLcdLine2, tStr); 
+      }
+      lcd.setCursor(0, 0); lcd.print(blynkLcdLine1); 
+      lcd.setCursor(0, 1); lcd.print(blynkLcdLine2);
+    }
+    delay(20); 
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  lcd.init(); lcd.backlight(); 
+  
+  faatakServo.setPeriodHertz(50); 
+  faatakServo.attach(servoPin, 500, 2400); 
+  faatakServo.write(0);       
+  
+  pinMode(pumpPin, OUTPUT); 
+  digitalWrite(pumpPin, RELAY_OFF); 
+
+  pinMode(btnFaatakPin, INPUT_PULLUP); 
+  pinMode(btnHour, INPUT_PULLUP);
+  pinMode(btnMin, INPUT_PULLUP); 
+  pinMode(btnStart, INPUT_PULLUP);
+  
+  LoRa.setPins(ss, rst, dio0);
+  if (!LoRa.begin(434E6)) { lcd.clear(); lcd.print("LoRa Error!"); while (1); }
+  LoRa.setSyncWord(0xA5); 
+
+  xTaskCreatePinnedToCore(HardwareLogic, "HW_Task", 4096, NULL, 1, &HW_Task, 0);
+  BlynkEdgent.begin(); 
+}
+
+void loop() {
+  BlynkEdgent.run(); 
+  if (Blynk.connected()) {
+    static unsigned long lastAppSync = 0;
+    if (millis() - lastAppSync > 1000) { 
+      lastAppSync = millis();
+      Blynk.virtualWrite(V1, faatakOpen);
+      Blynk.virtualWrite(V3, (currentRelayState == RELAY_ON) ? 1 : 0);
+      Blynk.virtualWrite(V5, isAutoMode); 
+      Blynk.virtualWrite(V2, moisturePercent);
+      Blynk.virtualWrite(V7, blynkLcdLine1); 
+      Blynk.virtualWrite(V8, blynkLcdLine2); 
+      if (!systemActive) Blynk.virtualWrite(V4, "System OFF"); 
+      else if (isTimerRunning) Blynk.virtualWrite(V4, "Timer Active"); 
+      else if (isAutoMode) Blynk.virtualWrite(V4, "Auto Mode"); 
+      else Blynk.virtualWrite(V4, "Standby");
+    }
+  }
+}
